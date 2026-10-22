@@ -1037,6 +1037,8 @@ cancel_auto_shutdown() {
     fi
     rm -f "$STATE_DIR/sleeper.pid"
   fi
+  # Replace an older installed copy that still treats --expired as a full shutdown.
+  install_helper_script || true
   echo "Automatic shutdown is off. The VPN stays up until you run: sudo oneday-vpn down"
   set -e
   return 0

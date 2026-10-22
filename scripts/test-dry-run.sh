@@ -78,8 +78,14 @@ grep -q 'MASQUERADE' "$POSTUP"
 grep -q -- '-d 192.168.1.0/24' "$POSTUP"
 bash -n "$POSTUP"
 bash -n "$POSTDOWN"
-if [[ -e $ROOT/dry-run-out/etc/systemd/system/oneday-vpn-expire.timer ]]; then
-  echo "setup still installed an automatic shutdown timer" >&2
+if [[ -e $ROOT/dry-run-out/etc/systemd/system/oneday-vpn-expire.timer \
+   || -e $ROOT/dry-run-out/etc/systemd/system/oneday-vpn-expire.service \
+   || -e $ROOT/dry-run-out/var/lib/oneday-vpn/sleeper.pid ]]; then
+  echo "setup still scheduled an automatic shutdown" >&2
+  exit 1
+fi
+if grep -q -E 'EXPIRES|OnCalendar|oneday-vpn-expire' "$STATE" "$HOWTO" "$ROOT/dry-run-out-log.txt"; then
+  echo "setup output still mentions an automatic shutdown" >&2
   exit 1
 fi
 if grep -q 'Expires:' "$CONF" "$HOWTO"; then
@@ -198,13 +204,45 @@ code=0
 bash "$SCRIPT" setup --dry-run --port 80 >/dev/null 2>&1 || code=$?
 [[ $code -ne 0 ]]
 
-bash "$SCRIPT" --help >/dev/null
+code=0
+bash "$SCRIPT" setup --dry-run --hours 24 >/dev/null 2>&1 || code=$?
+[[ $code -ne 0 ]]
+
+help=$(bash "$SCRIPT" --help)
+if grep -q -- '--hours' <<<"$help"; then
+  echo "help still offers --hours" >&2
+  exit 1
+fi
+grep -q 'down --expired' <<<"$help"
+grep -q 'stays up' <<<"$help"
 
 bash "$SCRIPT" tailscale --dry-run --lan-if eth0 --lan-ip 192.168.1.20 --lan-cidr 192.168.1.0/24 \
   >"$ROOT/dry-run-tailscale.txt"
 grep -q 'Dry run only' "$ROOT/dry-run-tailscale.txt"
 grep -q '192.168.1.0/24' "$ROOT/dry-run-tailscale.txt"
 grep -q 'stays up' "$ROOT/dry-run-tailscale.txt"
+if [[ -e $ROOT/dry-run-out/etc/systemd/system/oneday-vpn-expire.timer \
+   || -e $ROOT/dry-run-out/var/lib/oneday-vpn/sleeper.pid ]]; then
+  echo "tailscale setup still scheduled an automatic shutdown" >&2
+  exit 1
+fi
+if grep -q 'EXPIRES' "$ROOT/dry-run-out/var/lib/oneday-vpn/state.env"; then
+  echo "tailscale state still records an expiry" >&2
+  exit 1
+fi
+
+# down --expired cancels only a leftover timer. The generated VPN stays.
+run_setup \
+  --lan-if eth0 \
+  --lan-ip 192.168.1.20 \
+  --lan-cidr 192.168.1.0/24 \
+  --endpoint 203.0.113.10:51820 \
+  >/dev/null
+bash "$SCRIPT" down --expired --dry-run
+[[ -f $ROOT/dry-run-out/etc/wireguard/oneday0.conf ]]
+[[ -f $ROOT/dry-run-out/home/oneday-client.conf ]]
+bash "$SCRIPT" down --dry-run
+[[ ! -e $ROOT/dry-run-out/etc/wireguard/oneday0.conf ]]
 
 rm -rf "$ROOT/dry-run-out" "$ROOT/dry-run-out-log.txt" "$ROOT/dry-run-full.txt" "$ROOT/dry-run-tailscale.txt"
 echo "ok"
