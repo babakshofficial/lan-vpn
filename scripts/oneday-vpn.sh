@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
-# One-day VPN: share the LAN this computer is on with one client, then close it.
-# Run on that Linux computer, as root:
-#   sudo bash scripts/oneday-vpn.sh setup
-#   sudo bash scripts/oneday-vpn.sh tailscale
+# Share the LAN this computer is on with one client.
+# The tunnel stays up until you run: sudo oneday-vpn down
+#
+# Download and run on the Linux computer that is on that LAN:
+#   curl -fsSL https://raw.githubusercontent.com/babakshofficial/lan-vpn/main/scripts/oneday-vpn.sh -o oneday-vpn.sh
+#   sudo bash oneday-vpn.sh setup
+#   sudo bash oneday-vpn.sh tailscale
+#   sudo oneday-vpn status
+#   sudo oneday-vpn down
 set -euo pipefail
 
 IFACE=oneday0
-HOURS=24
 PORT=51820
 DRY_RUN=0
 FULL_TUNNEL=0
@@ -33,21 +37,23 @@ SCRIPT_PATH=$(readlink -f "${BASH_SOURCE[0]}")
 
 usage() {
   cat <<EOF
-Usage:
-  sudo bash scripts/oneday-vpn.sh setup [--hours 24] [--full-tunnel] [--endpoint HOST:PORT]
+Download on the Linux computer that is on your LAN, then run:
+
+  curl -fsSL https://raw.githubusercontent.com/babakshofficial/lan-vpn/main/scripts/oneday-vpn.sh -o oneday-vpn.sh
+  sudo bash oneday-vpn.sh setup [--full-tunnel] [--endpoint HOST:PORT]
+  sudo bash oneday-vpn.sh tailscale
   sudo oneday-vpn status
   sudo oneday-vpn show
   sudo oneday-vpn down
-  sudo bash scripts/oneday-vpn.sh tailscale
 
-setup       Start WireGuard, write a one-client config, and remove it after --hours
+setup       Start WireGuard and write a one-client config. It stays up until you stop it.
 tailscale   Use when setup reports CGNAT, or when you cannot forward a UDP port
-status      Show whether the tunnel is up and when it expires
+status      Show whether the tunnel is up
 show        Print the client config again
-down        Revoke access now
+down        Turn the VPN off and revoke the client
+            down --expired   only cancels an older 24-hour timer and leaves the VPN up
 
 Options:
-  --hours N          Lifetime in hours, from 1 to 48 (default 24)
   --port N           UDP listen port (default 51820)
   --endpoint HOST[:PORT]
   --public-ip ADDR   Skip the public-IP lookup
@@ -118,11 +124,6 @@ parse_args() {
         usage
         exit 0
         ;;
-      --hours)
-        [[ $# -ge 2 ]] || die "--hours needs a number"
-        HOURS=$2
-        shift 2
-        ;;
       --port)
         [[ $# -ge 2 ]] || die "--port needs a number"
         PORT=$2
@@ -185,8 +186,6 @@ parse_args() {
     esac
   done
 
-  [[ $HOURS =~ ^[0-9]+$ ]] || die "--hours must be a whole number"
-  [[ $HOURS -ge 1 && $HOURS -le 48 ]] || die "--hours must be from 1 to 48"
   [[ $PORT =~ ^[0-9]+$ ]] || die "--port must be a whole number"
   [[ $PORT -ge 1024 && $PORT -le 65535 ]] || die "--port must be from 1024 to 65535"
 }
@@ -349,7 +348,7 @@ That address is a private or carrier-grade NAT address, so a client on the
 internet cannot open a UDP port to this computer. Port forwarding will not work.
 
 The VPN was not started. Run Tailscale instead. It reaches this computer
-without a port forward, and it still shuts off after ${HOURS} hours:
+without a port forward, and it stays up until you turn it off:
 
   sudo bash ${SCRIPT_PATH} tailscale
 
@@ -417,18 +416,6 @@ gen_material() {
   fi
 }
 
-compute_expiry() {
-  EXPIRES_EPOCH=$(date -d "+${HOURS} hours" +%s)
-  EXPIRES_CAL=$(date -d "@${EXPIRES_EPOCH}" '+%Y-%m-%d %H:%M:%S')
-  EXPIRES_LOCAL=$(date -d "@${EXPIRES_EPOCH}" '+%Y-%m-%d %H:%M:%S %Z')
-  EXPIRES_UTC=$(date -u -d "@${EXPIRES_EPOCH}" '+%Y-%m-%d %H:%M:%S UTC')
-  if [[ -e /usr/share/zoneinfo/Asia/Tehran ]]; then
-    EXPIRES_TEHRAN=$(TZ=Asia/Tehran date -d "@${EXPIRES_EPOCH}" '+%Y-%m-%d %H:%M:%S %Z')
-  else
-    EXPIRES_TEHRAN=""
-  fi
-}
-
 write_state() {
   {
     printf 'MODE=%q\n' "$MODE"
@@ -441,10 +428,6 @@ write_state() {
     printf 'ENDPOINT_HOST=%q\n' "${ENDPOINT_HOST:-}"
     printf 'ENDPOINT_PORT=%q\n' "${ENDPOINT_PORT:-$PORT}"
     printf 'FULL_TUNNEL=%q\n' "$FULL_TUNNEL"
-    printf 'EXPIRES_EPOCH=%q\n' "$EXPIRES_EPOCH"
-    printf 'EXPIRES_LOCAL=%q\n' "$EXPIRES_LOCAL"
-    printf 'EXPIRES_UTC=%q\n' "$EXPIRES_UTC"
-    printf 'EXPIRES_TEHRAN=%q\n' "${EXPIRES_TEHRAN:-}"
     printf 'CLIENT_CONF_PATH=%q\n' "${CLIENT_CONF_PATH:-}"
     printf 'CLIENT_HOWTO_PATH=%q\n' "${CLIENT_HOWTO_PATH:-}"
     printf 'CLIENT_PNG_PATH=%q\n' "${CLIENT_PNG_PATH:-}"
@@ -533,7 +516,7 @@ write_server_conf() {
     install -d -m 700 /etc/wireguard
   fi
   cat >"$WG_CONF" <<EOF
-# Managed by oneday-vpn. Removed automatically at ${EXPIRES_LOCAL}.
+# Managed by oneday-vpn. Stays up until you run: oneday-vpn down
 [Interface]
 Address = ${VPN_SERVER_IP}/${VPN_PREFIX}
 ListenPort = ${PORT}
@@ -587,8 +570,7 @@ write_client_files() {
     dns_line=""
   fi
   cat >"$CLIENT_CONF_PATH" <<EOF
-# One-day VPN
-# Expires: ${EXPIRES_LOCAL} (${EXPIRES_UTC})
+# VPN access to this network. Stays up until the server operator turns it off.
 # Reaches: $(reach_phrase)
 [Interface]
 PrivateKey = ${CLIENT_PRIV}
@@ -606,15 +588,11 @@ EOF
   chmod 600 "$STATE_DIR/client.conf"
 
   {
-    echo "One-day network access"
-    echo "Expires: ${EXPIRES_LOCAL} (${EXPIRES_UTC})"
-    if [[ -n $EXPIRES_TEHRAN ]]; then
-      echo "Asia/Tehran: ${EXPIRES_TEHRAN}"
-    fi
+    echo "Network access"
     echo
     echo "The file oneday-client.conf is the connection. Treat it like a password."
     echo "It can reach $(reach_phrase)."
-    echo "It stops working at the expiry time above."
+    echo "It stays up until the person who runs the server turns it off."
     echo
     echo "1. Install WireGuard."
     echo "   Windows, Mac, and Linux: https://www.wireguard.com/install/"
@@ -876,42 +854,6 @@ install_helper_script() {
   fi
 }
 
-install_timer() {
-  mkdir -p "$UNIT_DIR"
-  cat >"$UNIT_DIR/oneday-vpn-expire.service" <<EOF
-[Unit]
-Description=Remove the one-day VPN
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/oneday-vpn down --expired
-EOF
-  cat >"$UNIT_DIR/oneday-vpn-expire.timer" <<EOF
-[Unit]
-Description=End one-day VPN access
-
-[Timer]
-OnCalendar=${EXPIRES_CAL}
-AccuracySec=1min
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-EOF
-  if [[ $DRY_RUN == 1 ]]; then
-    return 0
-  fi
-  if have_systemd; then
-    systemctl daemon-reload
-    systemctl enable --now oneday-vpn-expire.timer
-  else
-    local seconds=$((HOURS * 3600))
-    nohup bash -c "sleep ${seconds}; exec /usr/local/sbin/oneday-vpn down --expired" >/var/log/oneday-vpn-sleeper.log 2>&1 &
-    echo $! >"$STATE_DIR/sleeper.pid"
-    echo "This computer has no systemd. Leave it on. If it reboots before expiry, run: sudo oneday-vpn down"
-  fi
-}
-
 start_wireguard() {
   if [[ $DRY_RUN == 1 ]]; then
     return 0
@@ -926,6 +868,7 @@ start_wireguard() {
     systemctl enable --now "wg-quick@${IFACE}"
   else
     wg-quick up "$IFACE"
+    echo "This computer has no systemd. A reboot stops the tunnel until you run: sudo wg-quick up ${IFACE}"
   fi
 }
 
@@ -947,16 +890,12 @@ print_card() {
   if [[ $DRY_RUN == 1 ]]; then
     echo "Dry run only. No VPN was started."
   else
-    echo "One-day VPN is up."
+    echo "VPN is up."
   fi
   if [[ $PLACEHOLDER_ENDPOINT == 1 || $PLACEHOLDER_LAN == 1 ]]; then
     echo "Some addresses below are examples. Pass the real LAN and endpoint to see a real card."
   fi
-  echo "Expires:     ${EXPIRES_LOCAL}"
-  echo "UTC:         ${EXPIRES_UTC}"
-  if [[ -n ${EXPIRES_TEHRAN:-} ]]; then
-    echo "Asia/Tehran: ${EXPIRES_TEHRAN}"
-  fi
+  echo "Stays up until you run: sudo oneday-vpn down"
   echo "Endpoint:    ${ENDPOINT_HOST}:${ENDPOINT_PORT}"
   echo "Client file:  ${CLIENT_CONF_PATH}"
   echo "Instructions: ${CLIENT_HOWTO_PATH}"
@@ -989,7 +928,7 @@ print_card() {
   fi
   echo
   echo "Send ${CLIENT_CONF_PATH} and ${CLIENT_HOWTO_PATH} through a private chat."
-  echo "To revoke access sooner: sudo oneday-vpn down"
+  echo "To turn it off: sudo oneday-vpn down"
   echo "To see if the client connected: sudo oneday-vpn status"
   echo "AllowedIPs in the client file: ${allowed}"
   echo "============================================================"
@@ -1033,7 +972,6 @@ cmd_setup() {
   choose_vpn_net
   validate_token "interface" "$LAN_IF"
   validate_token "vpn" "$VPN_NET"
-  compute_expiry
   prepare_dirs
   if [[ $DRY_RUN == 0 ]]; then
     SETUP_READY=1
@@ -1051,12 +989,11 @@ cmd_setup() {
   write_state
   apply_firewall
   install_helper_script
-  install_timer
   start_wireguard
   if [[ $DRY_RUN == 0 ]]; then
     trap - ERR INT TERM
   fi
-  log_msg "wireguard up endpoint=${ENDPOINT_HOST}:${ENDPOINT_PORT} expires=${EXPIRES_EPOCH} lan=${LAN_CIDR}"
+  log_msg "wireguard up endpoint=${ENDPOINT_HOST}:${ENDPOINT_PORT} lan=${LAN_CIDR}"
   print_card
 }
 
@@ -1079,10 +1016,40 @@ destroy_file() {
   fi
 }
 
+cancel_auto_shutdown() {
+  # Older builds scheduled `down --expired`. Leave the tunnel up and drop that timer.
+  [[ $DRY_RUN == 1 ]] && return 0
+  require_root
+  trap - ERR INT TERM
+  set +e
+  if have_systemd; then
+    systemctl disable --now oneday-vpn-expire.timer >/dev/null 2>&1 || true
+  fi
+  rm -f "$UNIT_DIR/oneday-vpn-expire.timer" "$UNIT_DIR/oneday-vpn-expire.service"
+  if have_systemd; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
+  if [[ -f ${STATE_DIR}/sleeper.pid ]]; then
+    local pid
+    pid=$(cat "$STATE_DIR/sleeper.pid" 2>/dev/null || true)
+    if [[ -n ${pid:-} && $pid != "$$" && $pid != "$PPID" ]]; then
+      kill "$pid" 2>/dev/null || true
+    fi
+    rm -f "$STATE_DIR/sleeper.pid"
+  fi
+  echo "Automatic shutdown is off. The VPN stays up until you run: sudo oneday-vpn down"
+  set -e
+  return 0
+}
+
 cmd_down() {
   # Flags may already have been parsed by main. Accept a direct --quiet too.
   if [[ ${1:-} == --quiet ]]; then
     QUIET=1
+  fi
+  if [[ $EXPIRED == 1 ]]; then
+    cancel_auto_shutdown
+    return 0
   fi
   trap - ERR INT TERM
   set +e
@@ -1140,14 +1107,12 @@ cmd_down() {
   destroy_file "${CLIENT_PNG_PATH:-}"
   destroy_file "$STATE_DIR/client.conf"
   rm -rf "$STATE_DIR"
-  log_msg "down expired=${EXPIRED}"
-  if [[ $EXPIRED == 1 ]]; then
-    echo "The one-day VPN has expired and has been removed."
-  elif [[ $QUIET == 0 ]]; then
+  log_msg "down"
+  if [[ $QUIET == 0 ]]; then
     if [[ $had_state == 1 ]]; then
-      echo "The one-day VPN is removed. The client can no longer connect."
+      echo "The VPN is off. The client can no longer connect."
     else
-      echo "No one-day VPN was configured. Leftover interface and timer were cleaned up."
+      echo "No VPN was configured. Leftover interface and timer were cleaned up."
     fi
   fi
   set -e
@@ -1164,19 +1129,11 @@ cmd_status() {
     die "Run as root: sudo oneday-vpn status"
   fi
   if ! load_state; then
-    echo "No one-day VPN is configured."
+    echo "No VPN is configured."
     exit 0
   fi
-  local now
-  now=$(date +%s)
   echo "Mode:    ${MODE:-unknown}"
-  echo "Expires: ${EXPIRES_LOCAL:-unknown} (${EXPIRES_UTC:-})"
-  if [[ -n ${EXPIRES_TEHRAN:-} ]]; then
-    echo "Asia/Tehran: ${EXPIRES_TEHRAN}"
-  fi
-  if [[ -n ${EXPIRES_EPOCH:-} && $now -ge $EXPIRES_EPOCH ]]; then
-    echo "This window is past its expiry. Run: sudo oneday-vpn down"
-  fi
+  echo "Stays up until you run: sudo oneday-vpn down"
   if [[ ${MODE:-} == wireguard ]]; then
     echo "Endpoint: ${ENDPOINT_HOST:-}:${ENDPOINT_PORT:-}"
     echo "LAN:      ${LAN_CIDR:-} via ${LAN_IF:-} (${LAN_IP:-})"
@@ -1185,9 +1142,7 @@ cmd_status() {
       wg show "$IFACE"
     else
       echo "Tunnel:   down"
-      if [[ -z ${EXPIRES_EPOCH:-} || $now -lt $EXPIRES_EPOCH ]]; then
-        echo "Start it again with: sudo systemctl start wg-quick@${IFACE}"
-      fi
+      echo "Start it again with: sudo systemctl start wg-quick@${IFACE}"
     fi
   elif [[ ${MODE:-} == tailscale ]]; then
     echo "Advertised route: ${LAN_CIDR:-}"
@@ -1235,7 +1190,6 @@ cmd_tailscale() {
   fi
   ensure_basics
   detect_lan
-  compute_expiry
   if [[ $DRY_RUN == 1 ]]; then
     prepare_dirs
     MODE=tailscale
@@ -1248,11 +1202,8 @@ cmd_tailscale() {
     cat <<EOF
 Dry run only. No Tailscale login was started.
 On the real computer this installs Tailscale and advertises ${LAN_CIDR}.
-It would shut the route off at ${EXPIRES_LOCAL} (${EXPIRES_UTC}).
+The route stays up until you run: sudo oneday-vpn down
 EOF
-    if [[ -n $EXPIRES_TEHRAN ]]; then
-      echo "Asia/Tehran: ${EXPIRES_TEHRAN}"
-    fi
     return 0
   fi
 
@@ -1277,7 +1228,6 @@ EOF
   init_undo
   write_state
   install_helper_script
-  install_timer
   local -a args
   args=(tailscale up --advertise-routes="$LAN_CIDR" --snat-subnet-routes=true --accept-dns=false --ssh=false --hostname=oneday-vpn)
   if [[ -n ${SUDO_USER:-} && $SUDO_USER != root ]]; then
@@ -1293,16 +1243,12 @@ The client installs Tailscale from https://tailscale.com/download
 and signs in with the same account, then turns Tailscale on.
 They can reach ${LAN_CIDR}. This computer is ${LAN_IP}.
 
-Access is removed at ${EXPIRES_LOCAL} (${EXPIRES_UTC}).
+The route stays up until you run: sudo oneday-vpn down
 EOF
-  if [[ -n $EXPIRES_TEHRAN ]]; then
-    echo "Asia/Tehran: ${EXPIRES_TEHRAN}"
-  fi
-  echo "To revoke it sooner: sudo oneday-vpn down"
   echo
   "${args[@]}"
   trap - ERR INT TERM
-  log_msg "tailscale advertising ${LAN_CIDR} expires=${EXPIRES_EPOCH}"
+  log_msg "tailscale advertising ${LAN_CIDR}"
   echo "Tailscale is up. Approve ${LAN_CIDR} in the admin console if it is still pending."
 }
 

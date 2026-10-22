@@ -78,12 +78,16 @@ grep -q 'MASQUERADE' "$POSTUP"
 grep -q -- '-d 192.168.1.0/24' "$POSTUP"
 bash -n "$POSTUP"
 bash -n "$POSTDOWN"
-# shellcheck disable=SC1090
-source "$STATE"
-cal=$(date -d "@${EXPIRES_EPOCH}" '+%Y-%m-%d %H:%M:%S')
-grep -q "OnCalendar=${cal}" "$ROOT/dry-run-out/etc/systemd/system/oneday-vpn-expire.timer"
-grep -q 'ExecStart=/usr/local/sbin/oneday-vpn down --expired' \
-  "$ROOT/dry-run-out/etc/systemd/system/oneday-vpn-expire.service"
+if [[ -e $ROOT/dry-run-out/etc/systemd/system/oneday-vpn-expire.timer ]]; then
+  echo "setup still installed an automatic shutdown timer" >&2
+  exit 1
+fi
+if grep -q 'Expires:' "$CONF" "$HOWTO"; then
+  echo "client files still announce an expiry" >&2
+  exit 1
+fi
+grep -q 'stays up' "$HOWTO"
+grep -q 'Stays up until you run: sudo oneday-vpn down' "$ROOT/dry-run-out-log.txt"
 
 client_priv=$(awk -F' = ' '/^PrivateKey/ {print $2; exit}' "$CONF")
 server_priv=$(awk -F' = ' '/^PrivateKey/ {print $2; exit}' "$SERVER")
@@ -191,12 +195,6 @@ grep -q 'Tailscale' /tmp/oneday-cgnat.txt
 [[ ! -f $ROOT/dry-run-out/etc/wireguard/oneday0.conf ]]
 
 code=0
-bash "$SCRIPT" setup --dry-run --hours 0 >/dev/null 2>&1 || code=$?
-[[ $code -ne 0 ]]
-code=0
-bash "$SCRIPT" setup --dry-run --hours 99 >/dev/null 2>&1 || code=$?
-[[ $code -ne 0 ]]
-code=0
 bash "$SCRIPT" setup --dry-run --port 80 >/dev/null 2>&1 || code=$?
 [[ $code -ne 0 ]]
 
@@ -206,6 +204,7 @@ bash "$SCRIPT" tailscale --dry-run --lan-if eth0 --lan-ip 192.168.1.20 --lan-cid
   >"$ROOT/dry-run-tailscale.txt"
 grep -q 'Dry run only' "$ROOT/dry-run-tailscale.txt"
 grep -q '192.168.1.0/24' "$ROOT/dry-run-tailscale.txt"
+grep -q 'stays up' "$ROOT/dry-run-tailscale.txt"
 
 rm -rf "$ROOT/dry-run-out" "$ROOT/dry-run-out-log.txt" "$ROOT/dry-run-full.txt" "$ROOT/dry-run-tailscale.txt"
 echo "ok"
